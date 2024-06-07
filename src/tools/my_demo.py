@@ -12,27 +12,33 @@ End-to-End inference codes for
 """
 
 from __future__ import absolute_import, division, print_function
+
 import argparse
 import os
 import os.path as op
+
+import cv2
+import numpy as np
+import pyrealsense2 as rs
 import torch
 import torchvision.models as models
-import numpy as np
-import cv2
 from PIL import Image
 from torchvision import transforms
-from src.modeling.model import FastMETRO_Hand_Network as FastMETRO_Network
+
+import src.modeling.data.config as cfg
 from src.modeling._mano import MANO, Mesh
-from src.modeling.hrnet.hrnet_cls_net_featmaps import get_cls_net
 from src.modeling.hrnet.config import config as hrnet_config
 from src.modeling.hrnet.config import update_config as hrnet_update_config
-import src.modeling.data.config as cfg
+from src.modeling.hrnet.hrnet_cls_net_featmaps import get_cls_net
+from src.modeling.model import FastMETRO_Hand_Network as FastMETRO_Network
+from src.utils.geometric_layers import orthographic_projection
 from src.utils.logger import setup_logger
 from src.utils.miscellaneous import mkdir, set_seed
-from src.utils.geometric_layers import orthographic_projection
+
 # from src.utils.renderer_opendr import OpenDR_Renderer, visualize_reconstruction_opendr
 try:
-    from src.utils.renderer_pyrender import PyRender_Renderer, visualize_reconstruction_pyrender
+    from src.utils.renderer_pyrender import (PyRender_Renderer,
+                                             visualize_reconstruction_pyrender)
 except:
     print("Failed to import renderer_pyrender. Please see docs/Installation.md")
 
@@ -46,43 +52,62 @@ transform_visualize = transforms.Compose([transforms.Resize(224),
                                           transforms.CenterCrop(224),
                                           transforms.ToTensor()])                   
 
-def run_inference(args, image_list, FastMETRO_model, mano_model, renderer):
+def run_inference(args, FastMETRO_model, mano_model, renderer):
     # switch to evaluate mode
     FastMETRO_model.eval()
     
-    for image_file in image_list:
-        if 'pred' not in image_file:
-            img = Image.open(image_file)
-            img_tensor = transform(img)
-            img_visual = transform_visualize(img)
+    # start up realsense
+    pipeline = rs.pipeline()
+    config = rs.config()
+    pipeline_wrapper = rs.pipeline_wrapper(pipeline)
+    pipeline_profile = config.resolve(pipeline_wrapper)
+    device = pipeline_profile.get_device()
+    device_product_line = str(device.get_info(rs.camera_info.product_line))
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    pipeline.start(config)
 
-            batch_imgs = torch.unsqueeze(img_tensor, 0).cuda()
-            batch_visual_imgs = torch.unsqueeze(img_visual, 0).cuda()
+    # capture realsense measurement
+    frames = pipeline.wait_for_frames()
+    depth_frame = frames.get_depth_frame()
+    color_frame = frames.get_color_frame()
 
-            # forward-pass
-            out = FastMETRO_model(batch_imgs)
-            pred_cam, pred_3d_vertices_fine = out['pred_cam'], out['pred_3d_vertices_fine']     
-            
-            # obtain 3d joints from full mesh
-            pred_3d_joints_from_mano = mano_model.get_3d_joints(pred_3d_vertices_fine)
-            pred_3d_joints_from_mano_wrist = pred_3d_joints_from_mano[:,cfg.J_NAME.index('Wrist'),:]
-            # normalize predicted vertices 
-            pred_3d_vertices_fine = pred_3d_vertices_fine - pred_3d_joints_from_mano_wrist[:, None, :]
-            # normalize predicted joints 
-            pred_3d_joints_from_mano = pred_3d_joints_from_mano - pred_3d_joints_from_mano_wrist[:, None, :]
+    color_frame_npy = np.asanyarray(color_frame.get_data())
 
-            # visualization
-            visual_img = visualize_mesh(renderer,
-                                        batch_visual_imgs[0],
-                                        pred_3d_vertices_fine[0].detach(), 
-                                        pred_cam[0].detach())
-            visual_img = visual_img.transpose(1,2,0)
-            visual_img = np.asarray(visual_img)
-            if args.use_opendr_renderer:
-                visual_img[:,:,::-1] = visual_img[:,:,::-1]*255
-            temp_fname = image_file[:-4] + '_fastmetro_pred.jpg'
-            print('save to ', temp_fname)
-            cv2.imwrite(temp_fname, np.asarray(visual_img[:,:,::-1]))
+    # draw bounding box (before converting BGR to RGB)
+    bbox = cv2.selectROI("Draw a bounding box around the hand", color_frame_npy, fromCenter=False)
+
+    color_frame_npy[:, :, [0, 2]] = color_frame_npy[:, :, [2, 0]]  # convert BGR to RGB
+
+    img = Image.fromarray(color_frame_npy)
+    img_tensor = transform(img)
+    img_visual = transform_visualize(img)
+
+    batch_imgs = torch.unsqueeze(img_tensor, 0).cuda()
+    batch_visual_imgs = torch.unsqueeze(img_visual, 0).cuda()
+
+    # forward-pass
+    out = FastMETRO_model(batch_imgs)
+    pred_cam, pred_3d_vertices_fine = out['pred_cam'], out['pred_3d_vertices_fine']     
+    
+    # obtain 3d joints from full mesh
+    pred_3d_joints_from_mano = mano_model.get_3d_joints(pred_3d_vertices_fine)
+    pred_3d_joints_from_mano_wrist = pred_3d_joints_from_mano[:,cfg.J_NAME.index('Wrist'),:]
+    # normalize predicted vertices 
+    pred_3d_vertices_fine = pred_3d_vertices_fine - pred_3d_joints_from_mano_wrist[:, None, :]
+    # normalize predicted joints 
+    pred_3d_joints_from_mano = pred_3d_joints_from_mano - pred_3d_joints_from_mano_wrist[:, None, :]
+
+    # visualization
+    visual_img = visualize_mesh(renderer,
+                                batch_visual_imgs[0],
+                                pred_3d_vertices_fine[0].detach(), 
+                                pred_cam[0].detach())
+    visual_img = visual_img.transpose(1,2,0)
+    visual_img = np.asarray(visual_img)
+    if args.use_opendr_renderer:
+        visual_img[:,:,::-1] = visual_img[:,:,::-1]*255
+    cv2.imwrite(os.path.join(args.output_dir, "output.png"), np.asarray(visual_img[:,:,::-1]))
         
     logger.info("The inference completed successfully. Finalizing run...")
 
@@ -108,11 +133,6 @@ def visualize_mesh(renderer, image, pred_vertices, pred_cam):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    #########################################################
-    # Data related arguments
-    #########################################################
-    parser.add_argument("--image_file_or_path", default='./test_images/hand', type=str, 
-                        help="test data")
     #########################################################
     # Loading/Saving checkpoints
     #########################################################
@@ -217,20 +237,7 @@ def main(args):
     _FastMETRO_Network.to(args.device)
     logger.info("Run inference")
 
-    image_list = []
-    if not args.image_file_or_path:
-        raise ValueError("image_file_or_path not specified")
-    if op.isfile(args.image_file_or_path):
-        image_list = [args.image_file_or_path]
-    elif op.isdir(args.image_file_or_path):
-        # should be a path with images only
-        for filename in os.listdir(args.image_file_or_path):
-            if filename.endswith(".png") or filename.endswith(".jpg") and 'pred' not in filename:
-                image_list.append(args.image_file_or_path+'/'+filename) 
-    else:
-        raise ValueError("Cannot find images at {}".format(args.image_file_or_path))
-
-    run_inference(args, image_list, _FastMETRO_Network, mano_model, renderer) 
+    run_inference(args, _FastMETRO_Network, mano_model, renderer) 
 
 if __name__ == "__main__":
     args = parse_args()
